@@ -1,0 +1,180 @@
+name: Build Tailscale for Android
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  NDK_VERSION: r27b
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      ts_tag_name: ${{ fromJSON(steps.ts_release.outputs.data).tag_name }}
+      ts_tarball_url: ${{ fromJSON(steps.ts_release.outputs.data).tarball_url }}
+      mod_version: ${{ steps.version_info.mod_version }}
+      mod_version_code: ${{ steps.version_info.mod_version_code }}
+    steps:
+      - name: Get Tailscale latest stable release
+        id: ts_release
+        uses: octokit/request-action@v2.x
+        with:
+          route: GET /repos/{owner}/{repo}/releases/latest
+          owner: tailscale
+          repo: tailscale
+
+      - name: Get version info
+        id: version_info
+        run: |
+          MOD_VERSION="${{ fromJSON(steps.ts_release.outputs.data).tag_name }}.1"
+          IFS="." read -r MAJOR MINOR PATCH BUILD <<< "${MOD_VERSION//[^0-9.]/}"
+          MOD_VERSION_CODE=$(printf "%02d%02d%02d%02d" "${MAJOR}" "${MINOR}" "${PATCH}" "${BUILD}")
+          echo "::set-output name=mod_version::${MOD_VERSION}"
+          echo "::set-output name=mod_version::${MOD_VERSION_CODE}"
+
+  build:
+    name: Build - ${{ matrix.job.mod_arch }}
+    runs-on: ubuntu-latest
+    needs: [prepare]
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - { mod_arch: "arm",   ndk_arch: "armv7a",  go_arch: "arm"   }
+          - { mod_arch: "arm64", ndk_arch: "aarch64", go_arch: "arm64" }
+          - { mod_arch: "x64", ndk_arch: "x86_64", go_arch: "amd64" }
+    steps:
+      - name: Setup global environment variable
+        run: |
+          {
+            echo "MOD_VERSION=${{ needs.prepare.outputs.mod_version }}"
+            echo "MOD_VERSION_CODE=${{ needs.prepare.outputs.mod_version_code }}"
+            echo "MOD_ZIP_NAME=Magisk-Tailscaled-${{ needs.prepare.outputs.mod_version }}-${{ matrix.job.mod_arch }}"
+            echo "TS_BIN_PATH=${{ github.workspace }}/files/tailscale.combined-${{ matrix.job.go_arch }}"
+            echo "GH_RELEASE_PREFIX_URL=https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare.outputs.mod_version_code }}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: false
+          local-cache: true
+
+      - name: Display NDK path
+        run: |
+          echo "NDK path: ${{ steps.setup-ndk.outputs.ndk-path }}"
+          ls -la ${{ steps.setup-ndk.outputs.ndk-path }}
+
+      - name: Download latest Tailscale source code
+        run: |
+          mkdir -p build/tailscale
+          pushd build
+          curl -L ${{ needs.prepare.outputs.ts_tarball_url }} -o tailscale.tar.gz
+          tar -xzf tailscale.tar.gz -C tailscale --strip-components=1
+          ls -la tailscale
+          rm tailscale.tar.gz
+          popd
+
+      - name: Cache local go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Build Tailscale for Android
+        env:
+          CC: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.job.ndk_arch }}-linux-androideabi21-clang
+          CCX: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.job.ndk_arch }}-linux-androideabi21-clang++
+          CGO_ENABLED: 1
+          GOOS: android
+          GOARCH: ${{ matrix.job.go_arch }}
+          TS_USE_TOOLCHAIN: 1
+        run: |
+          pushd build/tailscale
+
+          # Patching etc/resolv.conf to readable dir
+          sed -i 's|/etc|/data/adb/tailscale/tmp|g' net/dns/resolvconfpath_default.go
+
+          ./build_dist.sh --box -trimpath -o ${{ env.TS_BIN_PATH }} ./cmd/tailscaled
+          file ${{ env.TS_BIN_PATH }}
+          
+          popd
+          rm -rf build
+
+      - name: Install UPX
+        uses: crazy-max/ghaction-upx@v3
+        with:
+          install-only: true
+
+      - name: Compress binaries
+        run: |
+          # https://tailscale.com/kb/1207/small-tailscale
+          upx --version
+          mkdir -p files
+          du -hs ${{ env.TS_BIN_PATH }}
+          upx --lzma --best ${{ env.TS_BIN_PATH }}
+          du -hs ${{ env.TS_BIN_PATH }}
+    
+      - name: Update module.prop
+        run: |
+          sed -i "s/^\(version=\).*/\1${{ env.MOD_VERSION }}/" module.prop
+          sed -i "s/^\(versionCode=\).*/\1${{ env.MOD_VERSION_CODE }}/" module.prop
+          sed -i "s/^\(updateJson=\).*/\1${{ env.GH_RELEASE_PREFIX_URL }}/update-${{ matrix.job.mod_arch }}" module.prop
+
+      - name: Update customize.sh
+        run: |
+          sed -i '/case/,/esac/{/case/b;/*)/b;/esac/b;d}' customize.sh
+          sed -i '/case/a\    ${{ matrix.job.mod_arch }}) F_ARCH=${{ matrix.job.go_arch }};;'
+
+      - name: Create Zip file for release
+        run: |
+          mkdir -p dist
+          # only enable module arch
+          zip -9 -r "./dist/${{ env.MOD_ZIP_NAME }}" . -x "*.git*" "dist/*" "*.zip" "*.json" "files/*" "*.md"
+          zip -9 "./dist/${{ env.MOD_ZIP_NAME }}" "files/tailscale.combined-${{ matrix.job.mod_arch }}"
+
+      - name: Generate changelog
+        run: |
+          tee dist/CHANGELOG.md << EOF
+          ## ${{ needs.prepare.outputs.mod_version }} 
+          - Update Tailscale binaries to ${{ needs.prepare.outputs.ts_tag_name }}
+          EOF
+
+      - name: Generate update json
+        run: |
+          tee dist/update-${{ matrix.job.mod_arch }}.json << EOF
+          {
+            "version": "${{ env.MOD_VERSION }}",
+            "versionCode": "${{ env.MOD_VERSION_CODE }}",
+            "zipUrl": "${{ env.GH_RELEASE_PREFIX_URL }}/${{ env.MOD_ZIP_NAME }}",
+            "changelog": "${{ env.GH_RELEASE_PREFIX_URL }}/CHANGELOG.md"
+          }
+          EOF
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          name: Magisk Tailscaled ${{ env.MOD_VERSION }}
+          tag_name: ${{ env.MOD_VERSION }}
+          body_path: dist/CHANGELOG.md
+          append_body: true
+          generate_release_notes: true
+          make_latest: true
+          files: |
+            ./dist/*
